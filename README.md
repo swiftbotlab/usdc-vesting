@@ -84,3 +84,30 @@ Output goes to `dist/`. The app is configured for sub-path serving (`base: './'`
 - All schedule data is public on-chain.
 - A contract beneficiary that cannot receive native USDC cannot be paid (see above).
 - Timeline scan starts from the deployment block; very long histories may take a few seconds.
+
+---
+
+## Notes added by Swift Bot Labs (everything above this line was written by Arc Studio)
+
+**Through the live app on Arc mainnet** (an injected wallet, fresh addresses of ours):
+
+| # | What happened | USDC | Tx |
+|---|---|---|---|
+| 2 | Beneficiary claims tranches 2 + 3 in the app | 0.04 | [0x0b67ce1f…5e7d](https://explorer.arc.io/tx/0x0b67ce1f8dc51096e861ce8ffbada368f2ce07643f5847418a0c464c8d4b5e7d) |
+| 4 | "3-minute test" linear schedule created in the app | 0.05 | [0x84eb3e47…2675](https://explorer.arc.io/tx/0x84eb3e47c46613ebf95070e47dd96f5059c84c35dc4c7e89384ebe59a9a42675) |
+| 4 | Beneficiary claims the vested part | 0.018333 | [0x5b6e0206…c471](https://explorer.arc.io/tx/0x5b6e0206cc011f21f11553cbed47c146ef425082de5b9d06ffddea4d54f7c471) |
+| 4 | Claims the rest after the end (completed) | 0.031667 | [0xefe30989…a5f](https://explorer.arc.io/tx/0xefe30989e1697552e6abf39ac2bd2571a809f0eec956937b00d5c47953f85a5f) |
+
+**How it was built.** One Arc Studio project (https://studio.arc.io/app/1a3a084e-f255-4435-985a-7be76f606025), driven
+through the Arc Studio CLI in 4 turns: (1) smart-contract pipeline: contract, Foundry suite, two auditors (stack-too-deep fix;
+blocklisted-beneficiary limitation), cut off by the daily limit; (2) the pipeline continued: Slither, 76 tests passing (71 unit/fuzz
++ 5 invariants, 256 runs x 128,000 calls), Arc Testnet deploy, ABI; (3) the app; (4) one fix turn with 16 findings from our
+end-to-end test. We re-ran the tests locally, deployed the byte-identical bytecode to Arc mainnet (our deploy script refuses
+otherwise) and ran the demos. No contract or app code was edited by hand.
+
+**Hosting.** Arc Studio does not export `dist/`, so `.github/workflows/pages.yml` (ours) installs from Studio's `bun.lock` and runs
+`vite build` on this source; GitHub Pages serves the result. `package.json` has no `build` script: use `bunx vite build` locally.
+
+**Video walkthrough:** https://github.com/swiftbotlab/usdc-vesting/releases/download/v1.0.0/usdc-vesting-arc-studio-mainnet.mp4
+
+Hand-added files: `.github/workflows/pages.yml`, `SECURITY.md`, `LICENSE`, `logo.png`, and this section.
