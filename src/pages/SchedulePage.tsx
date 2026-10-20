@@ -1,12 +1,12 @@
-import React, { useContext, useState, useEffect, useCallback } from 'react'
+import React, { useContext, useState, useEffect, useCallback, useRef, type MutableRefObject } from 'react'
 import { useAccount, useReadContracts, useWriteContract, useWaitForTransactionReceipt, useSwitchChain } from 'wagmi'
-import { createPublicClient, http, parseGwei, decodeEventLog } from 'viem'
+import { createPublicClient, http, parseGwei, decodeEventLog, keccak256, toBytes } from 'viem'
 import { toast } from 'sonner'
 import { NetworkContext } from '../App'
 import { NETWORKS } from '../config/networks'
 import { VESTING_ABI } from '../lib/abi'
 import {
-  formatNativeUsdc, formatTs, statusFromCode,
+  formatNativeUsdc, exactNativeUsdc, formatTs, statusFromCode,
   computeVestedAt, decodeContractError,
   type RawTranche,
 } from '../lib/vesting'
@@ -17,10 +17,20 @@ import { ExternalLink, RefreshCw, AlertTriangle } from 'lucide-react'
 const MIN_GAS_PRICE = parseGwei('20')
 const CHUNK = 9_000n
 
+// Precompute topic0 for each event so we can dispatch by topic0 rather than trying all 3
+const TOPIC0: Record<string, 'ScheduleCreated' | 'Claimed' | 'Cancelled' | 'TrancheAdded'> = {
+  [keccak256(toBytes('ScheduleCreated(uint256,address,address,uint8,uint128,uint64,uint64,uint64,bool)'))]: 'ScheduleCreated',
+  [keccak256(toBytes('Claimed(uint256,address,uint256,uint256,address)'))]: 'Claimed',
+  [keccak256(toBytes('Cancelled(uint256,address,address,uint256,uint256)'))]: 'Cancelled',
+  [keccak256(toBytes('TrancheAdded(uint256,uint256,uint64,uint128)'))]: 'TrancheAdded',
+}
+
 interface TimelineEvent {
-  type: 'ScheduleCreated' | 'Claimed' | 'Cancelled'
+  type: 'ScheduleCreated' | 'Claimed' | 'Cancelled' | 'TrancheAdded'
   txHash: string
+  logIndex: number
   blockNumber: bigint
+  blockTime?: number // unix seconds, set from getBlock when available
   args: Record<string, unknown>
 }
 
@@ -86,7 +96,8 @@ export function SchedulePage({ id }: { id: string }) {
       })
       const head = await client.getBlockNumber()
       const fromBlock = cfg.deploymentBlock
-      const events: TimelineEvent[] = []
+      const rawEvents: TimelineEvent[] = []
+      const seen = new Set<string>()
 
       for (let from = fromBlock; from <= head; from += CHUNK) {
         const to = from + CHUNK - 1n > head ? head : from + CHUNK - 1n
@@ -96,27 +107,78 @@ export function SchedulePage({ id }: { id: string }) {
           toBlock: to,
         })
         for (const log of logs) {
-          for (const eventName of ['ScheduleCreated', 'Claimed', 'Cancelled'] as const) {
-            try {
-              const dec = decodeEventLog({ abi: VESTING_ABI, data: log.data, topics: log.topics, eventName })
-              if (!dec?.args) continue
-              const args = dec.args as Record<string, unknown>
-              if (args['id'] !== scheduleId) continue
-              events.push({
-                type: eventName,
-                txHash: log.transactionHash ?? '',
-                blockNumber: log.blockNumber ?? 0n,
-                args,
-              })
-            } catch {
-              // not this event
-            }
+          const topic0 = log.topics[0]
+          if (!topic0) continue
+          const eventName = TOPIC0[topic0]
+          if (!eventName) continue
+          // Decode by the correct event name only
+          try {
+            const dec = decodeEventLog({ abi: VESTING_ABI, data: log.data, topics: log.topics, eventName })
+            if (!dec?.args) continue
+            const args = dec.args as Record<string, unknown>
+            if (args['id'] !== scheduleId) continue
+            // Deduplicate by txHash+logIndex
+            const key = `${log.transactionHash ?? ''}-${log.logIndex ?? 0}`
+            if (seen.has(key)) continue
+            seen.add(key)
+            rawEvents.push({
+              type: eventName,
+              txHash: log.transactionHash ?? '',
+              logIndex: log.logIndex ?? 0,
+              blockNumber: log.blockNumber ?? 0n,
+              args,
+            })
+          } catch {
+            // malformed log — skip
           }
         }
       }
 
-      events.sort((a, b) => (a.blockNumber < b.blockNumber ? -1 : 1))
-      return { events, error: false }
+      // Sort by block then logIndex
+      rawEvents.sort((a, b) => {
+        if (a.blockNumber !== b.blockNumber) return a.blockNumber < b.blockNumber ? -1 : 1
+        return a.logIndex - b.logIndex
+      })
+
+      // Fetch block timestamps in a single multicall batch for unique blocks
+      const uniqueBlocks = [...new Set(rawEvents.map((e) => e.blockNumber))]
+      const blockTimes = new Map<bigint, number>()
+      try {
+        await Promise.all(
+          uniqueBlocks.map(async (bn) => {
+            const blk = await client.getBlock({ blockNumber: bn })
+            blockTimes.set(bn, Number(blk.timestamp))
+          })
+        )
+      } catch {
+        // timestamps are best-effort
+      }
+      const events = rawEvents.map((e) => ({
+        ...e,
+        blockTime: blockTimes.get(e.blockNumber),
+      }))
+
+      // Group consecutive TrancheAdded events into a single synthetic entry
+      const collapsed: TimelineEvent[] = []
+      for (let i = 0; i < events.length; i++) {
+        if (events[i].type === 'TrancheAdded') {
+          let count = 1
+          while (i + count < events.length && events[i + count].type === 'TrancheAdded') count++
+          collapsed.push({
+            type: 'TrancheAdded',
+            txHash: events[i].txHash,
+            logIndex: events[i].logIndex,
+            blockNumber: events[i].blockNumber,
+            blockTime: events[i].blockTime,
+            args: { count },
+          })
+          i += count - 1
+        } else {
+          collapsed.push(events[i])
+        }
+      }
+
+      return { events: collapsed, error: false }
     } catch {
       return { events: [], error: true }
     }
@@ -138,12 +200,22 @@ export function SchedulePage({ id }: { id: string }) {
   // Tx hooks
   const { writeContractAsync, isPending } = useWriteContract()
   const [txHash, setTxHash] = useState<`0x${string}` | undefined>()
-  const { isLoading: isConfirming } = useWaitForTransactionReceipt({
-    hash: txHash,
-    onReplaced: () => { void refetch() },
-  })
+  const { isLoading: isConfirming } = useWaitForTransactionReceipt({ hash: txHash })
 
   const [showCancelConfirm, setShowCancelConfirm] = useState(false)
+
+  // useRef so updating inside an effect doesn't trigger set-state-in-effect
+  const pendingToastRef = useRef<string | number | undefined>(undefined)
+
+  // Dismiss confirming toast once receipt lands, then refresh data
+  const { isSuccess: receiptSuccess } = useWaitForTransactionReceipt({ hash: txHash })
+  useEffect(() => {
+    if (!receiptSuccess || !txHash) return
+    if (pendingToastRef.current !== undefined) toast.dismiss(pendingToastRef.current)
+    pendingToastRef.current = undefined
+    void refetch()
+    void fetchTimeline()
+  }, [receiptSuccess, txHash]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleClaim = useCallback(async () => {
     if (!address || !isValidId) return
@@ -156,18 +228,17 @@ export function SchedulePage({ id }: { id: string }) {
         maxFeePerGas: MIN_GAS_PRICE, maxPriorityFeePerGas: MIN_GAS_PRICE,
       })
       setTxHash(hash)
-      toast.loading('Confirming...', { id: tid })
-      setTimeout(() => { void refetch(); void fetchTimeline() }, 4000)
-      toast.success('Claimed!', {
-        id: tid,
+      const confirmId = toast.loading('Confirming on-chain…', {
         action: { label: 'Explorer', onClick: () => window.open(`${cfg.explorerBase}/tx/${hash}`, '_blank') },
       })
+      toast.dismiss(tid)
+      pendingToastRef.current = confirmId
     } catch (err) {
       const msg = decodeContractError(err)
       if (!msg.includes('cancelled')) toast.error(msg, { id: tid })
       else toast.dismiss(tid)
     }
-  }, [address, chainId, cfg, scheduleId, isValidId, writeContractAsync, switchChain, refetch, fetchTimeline])
+  }, [address, chainId, cfg, scheduleId, isValidId, writeContractAsync, switchChain, pendingToastRef])
 
   const handleCancel = useCallback(async () => {
     if (!address || !isValidId) return
@@ -181,18 +252,17 @@ export function SchedulePage({ id }: { id: string }) {
         maxFeePerGas: MIN_GAS_PRICE, maxPriorityFeePerGas: MIN_GAS_PRICE,
       })
       setTxHash(hash)
-      toast.loading('Confirming...', { id: tid })
-      setTimeout(() => { void refetch(); void fetchTimeline() }, 4000)
-      toast.success('Schedule cancelled.', {
-        id: tid,
+      const confirmId = toast.loading('Confirming on-chain…', {
         action: { label: 'Explorer', onClick: () => window.open(`${cfg.explorerBase}/tx/${hash}`, '_blank') },
       })
+      toast.dismiss(tid)
+      pendingToastRef.current = confirmId
     } catch (err) {
       const msg = decodeContractError(err)
       if (!msg.includes('cancelled')) toast.error(msg, { id: tid })
       else toast.dismiss(tid)
     }
-  }, [address, chainId, cfg, scheduleId, isValidId, writeContractAsync, switchChain, refetch, fetchTimeline])
+  }, [address, chainId, cfg, scheduleId, isValidId, writeContractAsync, switchChain, pendingToastRef])
 
   // ─── Early returns (after all hooks) ─────────────────────────────────────
   if (!isValidId) {
@@ -215,7 +285,8 @@ export function SchedulePage({ id }: { id: string }) {
   const vested = rawSchedule ? computeVestedAt(rawSchedule, rawTranches, nowSec) : 0n
   const claimedMarkers = timeline
     .filter((e) => e.type === 'Claimed')
-    .map((e) => Number((e.args as { blockNumber?: bigint })?.blockNumber ?? 0n))
+    .map((e) => e.blockTime ?? 0)
+    .filter((t) => t > 0)
 
   const isSubmitting = isPending || isConfirming
   const status = statusFromCode(statusCode)
@@ -276,10 +347,10 @@ export function SchedulePage({ id }: { id: string }) {
         </div>
 
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-4">
-          <Stat label="Claimed" value={formatNativeUsdc(s.claimed)} />
-          <Stat label="Claimable" value={formatNativeUsdc(onChainClaimable)} accent={onChainClaimable > 0n} />
-          <Stat label="Total" value={formatNativeUsdc(s.total)} />
-          <Stat label="Refunded" value={formatNativeUsdc(s.refunded)} />
+          <Stat label="Claimed" value={formatNativeUsdc(s.claimed)} title={exactNativeUsdc(s.claimed)} />
+          <Stat label="Claimable" value={formatNativeUsdc(onChainClaimable)} accent={onChainClaimable > 0n} title={exactNativeUsdc(onChainClaimable)} />
+          <Stat label="Total" value={formatNativeUsdc(s.total)} title={exactNativeUsdc(s.total)} />
+          <Stat label="Refunded" value={formatNativeUsdc(s.refunded)} title={exactNativeUsdc(s.refunded)} />
         </div>
       </div>
 
@@ -325,15 +396,33 @@ export function SchedulePage({ id }: { id: string }) {
               </thead>
               <tbody>
                 {rawTranches.map((t, i) => {
-                  const isPaid = Number(t.time) <= nowSec && status !== 'None'
+                  // Cumulative claimed up to and including this tranche
+                  let cumulative = 0n
+                  for (let j = 0; j <= i; j++) cumulative += rawTranches[j].amount
+                  const trancheTime = Number(t.time)
+                  const isCancelledAfter = s.cancelledAt > 0n && t.time > s.cancelledAt
+                  let trancheStatus: 'Paid' | 'Claimable' | 'Pending' | 'Cancelled'
+                  if (isCancelledAfter) {
+                    trancheStatus = 'Cancelled'
+                  } else if (trancheTime <= nowSec) {
+                    trancheStatus = cumulative <= s.claimed ? 'Paid' : 'Claimable'
+                  } else {
+                    trancheStatus = 'Pending'
+                  }
+                  const statusColors: Record<typeof trancheStatus, string> = {
+                    Paid: 'bg-surface-3 text-text-muted',
+                    Claimable: 'bg-success-muted text-success',
+                    Pending: 'bg-surface-3 text-text-muted',
+                    Cancelled: 'bg-error-muted text-error',
+                  }
                   return (
                     <tr key={i} className="border-b border-border last:border-0">
                       <td className="py-2 text-text-muted font-mono">{i + 1}</td>
-                      <td className="py-2 text-text-secondary text-xs">{formatTs(Number(t.time))}</td>
+                      <td className="py-2 text-text-secondary text-xs">{formatTs(trancheTime)}</td>
                       <td className="py-2 text-right font-mono tabular-nums">{formatNativeUsdc(t.amount)}</td>
                       <td className="py-2 text-right">
-                        <span className={`text-xs px-2 py-0.5 rounded-chip ${isPaid ? 'bg-success-muted text-success' : 'bg-surface-3 text-text-muted'}`}>
-                          {isPaid ? 'Vested' : 'Pending'}
+                        <span className={`text-xs px-2 py-0.5 rounded-chip ${statusColors[trancheStatus]}`}>
+                          {trancheStatus}
                         </span>
                       </td>
                     </tr>
@@ -369,9 +458,14 @@ export function SchedulePage({ id }: { id: string }) {
         {showCancelConfirm && (
           <div className="bg-error-muted border border-error/30 rounded-card p-4 space-y-3">
             <div className="text-sm text-text-primary font-medium">Confirm cancellation</div>
-            <p className="text-text-secondary text-xs">
-              Cancelling will send {formatNativeUsdc(vested)} USDC (vested) to the beneficiary and refund{' '}
-              {formatNativeUsdc(unvested)} USDC (unvested) back to you.
+            <p className="text-text-secondary text-xs leading-relaxed">
+              You get back{' '}
+              <span className="text-text-primary font-semibold">{formatNativeUsdc(unvested)} USDC</span>
+              {' '}(not vested yet).{' '}
+              The beneficiary keeps{' '}
+              <span className="text-text-primary font-semibold">{formatNativeUsdc(vested)} USDC</span>:{' '}
+              {formatNativeUsdc(s.claimed)} already claimed,{' '}
+              {formatNativeUsdc(vested > s.claimed ? vested - s.claimed : 0n)} still claimable any time.
             </p>
             <div className="flex gap-2">
               <button onClick={() => { void handleCancel() }} disabled={isSubmitting}
@@ -404,35 +498,77 @@ export function SchedulePage({ id }: { id: string }) {
           <div className="text-text-muted text-xs py-2">No events found yet.</div>
         ) : (
           <div className="space-y-2">
-            {timeline.map((ev, i) => (
-              <div key={i} className="flex items-start gap-3">
-                <div className={`w-2 h-2 rounded-full mt-1.5 flex-shrink-0 ${
-                  ev.type === 'Claimed' ? 'bg-success' : ev.type === 'Cancelled' ? 'bg-error' : 'bg-brand'
-                }`} />
-                <div className="flex-1 min-w-0">
-                  <div className="text-xs text-text-primary font-medium">{ev.type}</div>
-                  {ev.type === 'Claimed' && (
-                    <div className="text-xs text-text-muted">
-                      {formatNativeUsdc((ev.args as { amount?: bigint })?.amount ?? 0n)} USDC
-                      {' — '}caller{' '}
-                      <span className="font-mono">{String((ev.args as { caller?: string })?.caller ?? '').slice(0, 8)}…</span>
-                    </div>
-                  )}
-                  {ev.type === 'Cancelled' && (
-                    <div className="text-xs text-text-muted">
-                      Refunded {formatNativeUsdc((ev.args as { refunded?: bigint })?.refunded ?? 0n)} USDC
-                    </div>
-                  )}
-                  <a
-                    href={`${cfg.explorerBase}/tx/${ev.txHash}`}
-                    target="_blank" rel="noopener noreferrer"
-                    className="text-[10px] text-text-muted hover:text-brand transition-colors flex items-center gap-0.5 mt-0.5"
-                  >
-                    {ev.txHash.slice(0, 10)}…{ev.txHash.slice(-6)} <ExternalLink size={9} />
-                  </a>
+            {timeline.map((ev, i) => {
+              const dotColor = ev.type === 'Claimed' ? 'bg-success' : ev.type === 'Cancelled' ? 'bg-error' : ev.type === 'TrancheAdded' ? 'bg-brand/50' : 'bg-brand'
+              const timeStr = ev.blockTime ? formatTs(ev.blockTime) : `block ${ev.blockNumber.toString()}`
+              return (
+                <div key={i} className="flex items-start gap-3">
+                  <div className={`w-2 h-2 rounded-full mt-1.5 flex-shrink-0 ${dotColor}`} />
+                  <div className="flex-1 min-w-0">
+                    {ev.type === 'ScheduleCreated' && (() => {
+                      const a = ev.args as { kind?: number; total?: bigint }
+                      return (
+                        <>
+                          <div className="text-xs text-text-primary font-medium">
+                            Schedule created — {a.kind === 0 ? 'Linear' : 'Tranches'},{' '}
+                            {formatNativeUsdc(a.total ?? 0n)} USDC
+                          </div>
+                          <div className="text-[10px] text-text-muted">{timeStr}</div>
+                        </>
+                      )
+                    })()}
+                    {ev.type === 'TrancheAdded' && (() => {
+                      const a = ev.args as { count?: number }
+                      return (
+                        <>
+                          <div className="text-xs text-text-primary font-medium">
+                            {a.count ?? 1} tranche{(a.count ?? 1) !== 1 ? 's' : ''} added
+                          </div>
+                          <div className="text-[10px] text-text-muted">{timeStr}</div>
+                        </>
+                      )
+                    })()}
+                    {ev.type === 'Claimed' && (() => {
+                      const a = ev.args as { amount?: bigint; caller?: string; beneficiary?: string }
+                      const pushedBy = a.caller && a.beneficiary &&
+                        a.caller.toLowerCase() !== a.beneficiary.toLowerCase()
+                      return (
+                        <>
+                          <div className="text-xs text-text-primary font-medium">
+                            Claimed {formatNativeUsdc(a.amount ?? 0n)} USDC
+                            {pushedBy && (
+                              <span className="text-text-muted font-normal">
+                                {' '}— pushed by <span className="font-mono">{String(a.caller).slice(0, 6)}…{String(a.caller).slice(-4)}</span>
+                              </span>
+                            )}
+                          </div>
+                          <div className="text-[10px] text-text-muted">{timeStr}</div>
+                        </>
+                      )
+                    })()}
+                    {ev.type === 'Cancelled' && (() => {
+                      const a = ev.args as { vestedAmount?: bigint; refunded?: bigint }
+                      return (
+                        <>
+                          <div className="text-xs text-text-primary font-medium">
+                            Cancelled — {formatNativeUsdc(a.vestedAmount ?? 0n)} USDC vested kept,{' '}
+                            {formatNativeUsdc(a.refunded ?? 0n)} refunded to funder
+                          </div>
+                          <div className="text-[10px] text-text-muted">{timeStr}</div>
+                        </>
+                      )
+                    })()}
+                    <a
+                      href={`${cfg.explorerBase}/tx/${ev.txHash}`}
+                      target="_blank" rel="noopener noreferrer"
+                      className="text-[10px] text-text-muted hover:text-brand transition-colors flex items-center gap-0.5 mt-0.5"
+                    >
+                      {ev.txHash.slice(0, 10)}…{ev.txHash.slice(-6)} <ExternalLink size={9} />
+                    </a>
+                  </div>
                 </div>
-              </div>
-            ))}
+              )
+            })}
           </div>
         )}
         {timelineError && !timelineLoading && (
@@ -456,11 +592,16 @@ function NotFound({ msg }: { msg: string }) {
   )
 }
 
-function Stat({ label, value, accent }: { label: string; value: string; accent?: boolean }) {
+function Stat({ label, value, accent, title }: { label: string; value: string; accent?: boolean; title?: string }) {
   return (
     <div className="space-y-0.5">
       <div className="text-[10px] text-text-muted uppercase" style={{ letterSpacing: '0.06em' }}>{label}</div>
-      <div className={`font-mono tabular-nums text-sm ${accent ? 'text-success font-semibold' : 'text-text-primary'}`}>{value}</div>
+      <div
+        title={title}
+        className={`font-mono tabular-nums text-sm ${accent ? 'text-success font-semibold' : 'text-text-primary'} ${title ? 'cursor-help' : ''}`}
+      >
+        {value}
+      </div>
     </div>
   )
 }

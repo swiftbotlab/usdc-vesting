@@ -7,14 +7,21 @@ import { formatEther, parseEther } from 'viem'
 
 // ─── Amount Formatting ────────────────────────────────────────────────────────
 
-/** Format 18-decimal bigint as USDC string. Shows 6 decimals; more when very small. */
+/** Format 18-decimal bigint as USDC string. Shows 6 decimals with half-up rounding; more when very small. */
 export function formatNativeUsdc(raw: bigint, opts?: { decimals?: number }): string {
   const d = opts?.decimals ?? 6
-  const s = formatEther(raw)
-  const [int, frac = ''] = s.split('.')
-  const fracPadded = frac.padEnd(d, '0').slice(0, d)
-  // If all zeros in fracPadded but raw > 0, show more precision
-  if (BigInt(int) === 0n && raw > 0n) {
+  // Use BigInt arithmetic for half-up rounding at d decimal places
+  // 1 ether = 10^18; we want d decimal places so shift = 10^(18-d)
+  const shift = 10n ** BigInt(18 - d)
+  const half = shift / 2n
+  const rounded = (raw + half) / shift  // integer with d decimal places of precision
+  const s = rounded.toString()
+  // s is in units of 10^(-d), so last d digits are the fractional part
+  const padded = s.padStart(d + 1, '0')
+  const intPart = padded.slice(0, padded.length - d) || '0'
+  const fracPart = padded.slice(padded.length - d)
+  // If rounded gives 0 but raw > 0, show more precision (very small values)
+  if (intPart === '0' && fracPart === '0'.repeat(d) && raw > 0n) {
     const full = formatEther(raw)
     const [, f2 = ''] = full.split('.')
     const nonZeroIdx = f2.split('').findIndex((c) => c !== '0')
@@ -22,7 +29,12 @@ export function formatNativeUsdc(raw: bigint, opts?: { decimals?: number }): str
       return `0.${f2.slice(0, nonZeroIdx + 4)}`
     }
   }
-  return `${int}.${fracPadded}`
+  return `${intPart}.${fracPart}`
+}
+
+/** Exact display value for use in title="" tooltips (never truncated). */
+export function exactNativeUsdc(raw: bigint): string {
+  return formatEther(raw)
 }
 
 /** Parse human-readable USDC string to 18-decimal bigint. Returns null on invalid. */
@@ -44,7 +56,8 @@ export function shortAddr(addr: string): string {
 export function formatTs(ts: number): string {
   return new Date(ts * 1000).toLocaleString(undefined, {
     year: 'numeric', month: 'short', day: 'numeric',
-    hour: '2-digit', minute: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    timeZoneName: 'short',
   })
 }
 

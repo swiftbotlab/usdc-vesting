@@ -1,4 +1,4 @@
-import React, { useContext, useState } from 'react'
+import React, { useContext, useState, useRef, type MutableRefObject } from 'react'
 import { useAccount, useWriteContract, useWaitForTransactionReceipt, useSwitchChain } from 'wagmi'
 import { parseGwei, decodeEventLog } from 'viem'
 import { toast } from 'sonner'
@@ -14,10 +14,11 @@ import { Plus, Trash2, Zap, CalendarDays } from 'lucide-react'
 
 const MIN_GAS_PRICE = parseGwei('20')
 
+// step="1" keeps seconds; the value must include :ss for browsers that support it
 function toDatetimeLocal(sec: number): string {
   const d = new Date(sec * 1000)
   const pad = (n: number) => n.toString().padStart(2, '0')
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
 }
 
 function fromDatetimeLocal(s: string): number {
@@ -43,6 +44,10 @@ export function NewSchedulePage() {
   const [linEnd, setLinEnd] = useState(toDatetimeLocal(nowSec + 86400 * 365))
   const [linRevocable, setLinRevocable] = useState(true)
 
+  // Touch tracking for validation errors (#13)
+  const [linTouched, setLinTouched] = useState<Record<string, boolean>>({})
+  const [linSubmitAttempted, setLinSubmitAttempted] = useState(false)
+
   // ─── Tranches state ─────────────────────────────────────────────────────────
   const [trBeneficiary, setTrBeneficiary] = useState('')
   const [trTotal, setTrTotal] = useState('')
@@ -51,11 +56,52 @@ export function NewSchedulePage() {
     { time: nowSec + 86400 * 30, amount: '' },
     { time: nowSec + 86400 * 60, amount: '' },
   ])
+  // Track whether tranche row amounts were manually edited (so auto-fill doesn't override)
+  const trManualEdits = useRef<Set<number>>(new Set())
+  const [trTouched, setTrTouched] = useState<Record<string, boolean>>({})
+  const [trSubmitAttempted, setTrSubmitAttempted] = useState(false)
 
   // ─── Tx hooks ──────────────────────────────────────────────────────────────
   const { writeContractAsync, isPending } = useWriteContract()
   const [txHash, setTxHash] = useState<`0x${string}` | undefined>()
+  // useRef so that updating it inside an effect doesn't trigger set-state-in-effect
+  const pendingToastRef = useRef<string | number | undefined>(undefined)
   const { isLoading: isConfirming, data: receipt } = useWaitForTransactionReceipt({ hash: txHash })
+
+  // ─── Navigate to new schedule once receipt lands (#14 — dismiss toast) ─────
+  React.useEffect(() => {
+    if (!receipt || !txHash) return
+    // Dismiss any lingering confirming toast
+    if (pendingToastRef.current !== undefined) toast.dismiss(pendingToastRef.current)
+    pendingToastRef.current = undefined
+    for (const log of receipt.logs) {
+      try {
+        const decoded = decodeEventLog({
+          abi: VESTING_ABI,
+          data: log.data,
+          topics: log.topics,
+          eventName: 'ScheduleCreated',
+        })
+        if (decoded?.args) {
+          const id = (decoded.args as { id: bigint }).id
+          const nav = navigate
+          const net = network
+          toast.success(`Schedule #${id} created!`, {
+            action: {
+              label: 'View',
+              onClick: () => nav(`/${net}/schedule/${id}`),
+            },
+          })
+          navigate(`/${network}/schedule/${id}`)
+          return
+        }
+      } catch {
+        // not this log
+      }
+    }
+    toast.success('Schedule created!')
+    navigate(`/${network}/`)
+  }, [receipt, txHash, navigate, network]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ─── Linear validation ─────────────────────────────────────────────────────
   const linStartSec = fromDatetimeLocal(linStart)
@@ -67,7 +113,7 @@ export function NewSchedulePage() {
   // ─── Tranches validation ───────────────────────────────────────────────────
   const trVal = validateTranches(trBeneficiary, trTotal, trRows, nowSec)
 
-  // ─── Preview schedules for chart (no useMemo — React Compiler handles stability)
+  // ─── Preview schedules for chart ───────────────────────────────────────────
   const linPreview = {
     funder: '0x' as `0x${string}`,
     beneficiary: '0x' as `0x${string}`,
@@ -103,19 +149,50 @@ export function NewSchedulePage() {
     }
   }
 
+  // Auto-distribute tranche amounts evenly when total is set and rows have no manual edits
+  function distributeAmounts(rows: TrancheRow[], totalInput: string, manualEdits: Set<number>): TrancheRow[] {
+    const totalRaw = parseNativeUsdc(totalInput)
+    if (!totalRaw || totalRaw <= 0n || rows.length === 0) return rows
+    // Only auto-fill rows that haven't been manually edited
+    const unmanaged = rows.map((_, i) => i).filter((i) => !manualEdits.has(i))
+    if (unmanaged.length === 0) return rows
+    const managedSum = rows.reduce((s, r, i) => manualEdits.has(i) ? s + (parseNativeUsdc(r.amount) ?? 0n) : s, 0n)
+    const remainder = totalRaw > managedSum ? totalRaw - managedSum : 0n
+    if (remainder <= 0n) return rows
+    const perRow = remainder / BigInt(unmanaged.length)
+    const extra = remainder - perRow * BigInt(unmanaged.length)
+    return rows.map((r, i) => {
+      if (!unmanaged.includes(i)) return r
+      const isLast = i === unmanaged[unmanaged.length - 1]
+      const amt = isLast ? perRow + extra : perRow
+      return { ...r, amount: amt > 0n ? formatNativeUsdc(amt, { decimals: 6 }) : '' }
+    })
+  }
+
   const applyTrPreset = (preset: 'weekly4' | 'onepayout') => {
+    trManualEdits.current = new Set()
+    const totalRaw = parseNativeUsdc(trTotal)
     if (preset === 'weekly4') {
-      const amt = trTotal ? (parseNativeUsdc(trTotal) ?? 0n) / 4n : 0n
-      const amtStr = amt > 0n ? formatNativeUsdc(amt, { decimals: 6 }) : ''
-      setTrRows([
-        { time: nowSec + 86400 * 7, amount: amtStr },
-        { time: nowSec + 86400 * 14, amount: amtStr },
-        { time: nowSec + 86400 * 21, amount: amtStr },
-        { time: nowSec + 86400 * 28, amount: amtStr },
-      ])
+      const baseRows: TrancheRow[] = [
+        { time: nowSec + 86400 * 7, amount: '' },
+        { time: nowSec + 86400 * 14, amount: '' },
+        { time: nowSec + 86400 * 21, amount: '' },
+        { time: nowSec + 86400 * 28, amount: '' },
+      ]
+      const filled = totalRaw && totalRaw > 0n ? distributeAmounts(baseRows, trTotal, new Set()) : baseRows
+      setTrRows(filled)
     } else {
-      setTrRows([{ time: nowSec + 86400 * 30, amount: trTotal }])
+      const baseRows: TrancheRow[] = [{ time: nowSec + 86400 * 30, amount: '' }]
+      const filled = totalRaw && totalRaw > 0n ? distributeAmounts(baseRows, trTotal, new Set()) : baseRows
+      setTrRows(filled)
     }
+  }
+
+  // When trTotal changes, re-distribute amounts in non-manually-edited rows
+  const handleTrTotalChange = (val: string) => {
+    setTrTotal(val)
+    setTrRows((rows) => distributeAmounts(rows, val, trManualEdits.current))
+    setTrTouched((t) => ({ ...t, trTotal: true }))
   }
 
   // ─── Submit ────────────────────────────────────────────────────────────────
@@ -125,6 +202,14 @@ export function NewSchedulePage() {
     if (wrongChain) {
       switchChain({ chainId: cfg.chain.id })
       return
+    }
+
+    if (tab === 'linear') {
+      setLinSubmitAttempted(true)
+      if (!linVal.valid) return
+    } else {
+      setTrSubmitAttempted(true)
+      if (!trVal.valid) return
     }
 
     const toastId = toast.loading('Waiting for wallet confirmation...')
@@ -163,8 +248,12 @@ export function NewSchedulePage() {
         })
       }
       setTxHash(hash)
-      toast.loading('Confirming on-chain...', { id: toastId })
-      // Navigation happens in the useEffect below when receipt lands
+      // Show confirming toast; dismiss on receipt in the useEffect above
+      const confirmId = toast.loading('Confirming on-chain…', {
+        action: { label: 'Explorer', onClick: () => window.open(`${cfg.explorerBase}/tx/${hash}`, '_blank') },
+      })
+      toast.dismiss(toastId)
+      pendingToastRef.current = confirmId
     } catch (err) {
       const msg = decodeContractError(err)
       if (!msg.includes('cancelled')) {
@@ -175,38 +264,6 @@ export function NewSchedulePage() {
     }
   }
 
-  // Navigate to new schedule once receipt lands
-  React.useEffect(() => {
-    if (!receipt || !txHash) return
-    for (const log of receipt.logs) {
-      try {
-        const decoded = decodeEventLog({
-          abi: VESTING_ABI,
-          data: log.data,
-          topics: log.topics,
-          eventName: 'ScheduleCreated',
-        })
-        if (decoded?.args) {
-          const id = (decoded.args as { id: bigint }).id
-          const nav = navigate
-          const net = network
-          toast.success(`Schedule #${id} created!`, {
-            action: {
-              label: 'View',
-              onClick: () => nav(`/${net}/schedule/${id}`),
-            },
-          })
-          navigate(`/${network}/schedule/${id}`)
-          return
-        }
-      } catch {
-        // not this log
-      }
-    }
-    toast.success('Schedule created!')
-    navigate(`/${network}/`)
-  }, [receipt, txHash, navigate, network])
-
   const isSubmitting = isPending || isConfirming
   const canSubmitLinear = linVal.valid && !!address && !isSubmitting
   const canSubmitTranches = trVal.valid && !!address && !isSubmitting
@@ -214,14 +271,31 @@ export function NewSchedulePage() {
   // ─── Tranche row helpers ────────────────────────────────────────────────────
   const addTrRow = () => {
     const last = trRows[trRows.length - 1]
-    setTrRows([...trRows, { time: last ? last.time + 86400 * 7 : nowSec + 86400 * 7, amount: '' }])
+    const newRows = [...trRows, { time: last ? last.time + 86400 * 7 : nowSec + 86400 * 7, amount: '' }]
+    setTrRows(distributeAmounts(newRows, trTotal, trManualEdits.current))
   }
-  const removeTrRow = (i: number) => setTrRows(trRows.filter((_, idx) => idx !== i))
+  const removeTrRow = (i: number) => {
+    trManualEdits.current.delete(i)
+    // Re-index manual edits above the removed index
+    const newEdits = new Set<number>()
+    trManualEdits.current.forEach((idx) => { if (idx < i) newEdits.add(idx); else if (idx > i) newEdits.add(idx - 1) })
+    trManualEdits.current = newEdits
+    const newRows = trRows.filter((_, idx) => idx !== i)
+    setTrRows(distributeAmounts(newRows, trTotal, trManualEdits.current))
+  }
   const updateTrRow = (i: number, field: keyof TrancheRow, value: string | number) => {
+    if (field === 'amount') {
+      trManualEdits.current = new Set([...trManualEdits.current, i])
+    }
     setTrRows(trRows.map((r, idx) => idx === i ? { ...r, [field]: value } : r))
+    setTrTouched((t) => ({ ...t, [`row${i}`]: true }))
   }
 
   const wrongChain = address && chainId !== cfg.chain.id
+
+  // Determine which errors to show: only after touch or submit attempt
+  const showLinErrors = linSubmitAttempted || Object.keys(linTouched).length > 0
+  const showTrErrors = trSubmitAttempted || Object.keys(trTouched).length > 0
 
   return (
     <div className="max-w-xl mx-auto space-y-5 animate-fade-in">
@@ -285,6 +359,7 @@ export function NewSchedulePage() {
               placeholder="0x..."
               value={linBeneficiary}
               onChange={(e) => setLinBeneficiary(e.target.value)}
+              onBlur={() => setLinTouched((t) => ({ ...t, beneficiary: true }))}
               className="w-full h-10 px-3 rounded-btn bg-surface-3 border border-border text-text-primary text-sm font-mono placeholder:text-text-muted focus:outline-none focus:border-brand/50"
             />
           </Field>
@@ -298,6 +373,7 @@ export function NewSchedulePage() {
                 placeholder="0.000000"
                 value={linAmount}
                 onChange={(e) => setLinAmount(e.target.value)}
+                onBlur={() => setLinTouched((t) => ({ ...t, amount: true }))}
                 className="w-full h-10 px-3 pr-14 rounded-btn bg-surface-3 border border-border text-text-primary text-sm tabular-nums placeholder:text-text-muted focus:outline-none focus:border-brand/50"
               />
               <span className="absolute right-3 top-1/2 -translate-y-1/2 text-text-muted text-xs font-medium">USDC</span>
@@ -306,15 +382,21 @@ export function NewSchedulePage() {
 
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             <Field label="Start">
-              <input type="datetime-local" value={linStart} onChange={(e) => setLinStart(e.target.value)}
+              <input type="datetime-local" step="1" value={linStart}
+                onChange={(e) => setLinStart(e.target.value)}
+                onBlur={() => setLinTouched((t) => ({ ...t, start: true }))}
                 className="w-full h-10 px-2 rounded-btn bg-surface-3 border border-border text-text-primary text-xs focus:outline-none focus:border-brand/50" />
             </Field>
             <Field label="Cliff (optional)">
-              <input type="datetime-local" value={linCliff} onChange={(e) => setLinCliff(e.target.value)}
+              <input type="datetime-local" step="1" value={linCliff}
+                onChange={(e) => setLinCliff(e.target.value)}
+                onBlur={() => setLinTouched((t) => ({ ...t, cliff: true }))}
                 className="w-full h-10 px-2 rounded-btn bg-surface-3 border border-border text-text-primary text-xs focus:outline-none focus:border-brand/50" />
             </Field>
             <Field label="End">
-              <input type="datetime-local" value={linEnd} onChange={(e) => setLinEnd(e.target.value)}
+              <input type="datetime-local" step="1" value={linEnd}
+                onChange={(e) => setLinEnd(e.target.value)}
+                onBlur={() => setLinTouched((t) => ({ ...t, end: true }))}
                 className="w-full h-10 px-2 rounded-btn bg-surface-3 border border-border text-text-primary text-xs focus:outline-none focus:border-brand/50" />
             </Field>
           </div>
@@ -339,8 +421,8 @@ export function NewSchedulePage() {
             </div>
           )}
 
-          {/* Errors */}
-          {linVal.errors.length > 0 && (
+          {/* Validation errors — shown only after touch or submit attempt */}
+          {showLinErrors && linVal.errors.length > 0 && (
             <ul className="space-y-1">
               {linVal.errors.map((e) => (
                 <li key={e} className="text-error text-xs">{e}</li>
@@ -353,7 +435,7 @@ export function NewSchedulePage() {
             disabled={!canSubmitLinear}
             loading={isSubmitting}
             notConnected={!address}
-            onClick={handleSubmit}
+            onClick={() => { void handleSubmit() }}
           />
         </div>
       )}
@@ -373,14 +455,17 @@ export function NewSchedulePage() {
           </div>
 
           <Field label="Beneficiary address">
-            <input type="text" placeholder="0x..." value={trBeneficiary} onChange={(e) => setTrBeneficiary(e.target.value)}
+            <input type="text" placeholder="0x..." value={trBeneficiary}
+              onChange={(e) => setTrBeneficiary(e.target.value)}
+              onBlur={() => setTrTouched((t) => ({ ...t, beneficiary: true }))}
               className="w-full h-10 px-3 rounded-btn bg-surface-3 border border-border text-text-primary text-sm font-mono placeholder:text-text-muted focus:outline-none focus:border-brand/50" />
           </Field>
 
           <Field label="Total amount (USDC)">
             <div className="relative">
               <input type="number" min="0" step="any" placeholder="0.000000" value={trTotal}
-                onChange={(e) => setTrTotal(e.target.value)}
+                onChange={(e) => handleTrTotalChange(e.target.value)}
+                onBlur={() => setTrTouched((t) => ({ ...t, trTotal: true }))}
                 className="w-full h-10 px-3 pr-14 rounded-btn bg-surface-3 border border-border text-text-primary text-sm tabular-nums placeholder:text-text-muted focus:outline-none focus:border-brand/50" />
               <span className="absolute right-3 top-1/2 -translate-y-1/2 text-text-muted text-xs font-medium">USDC</span>
             </div>
@@ -400,6 +485,7 @@ export function NewSchedulePage() {
               <div key={i} className="flex gap-2 items-center">
                 <input
                   type="datetime-local"
+                  step="1"
                   value={toDatetimeLocal(row.time)}
                   onChange={(e) => updateTrRow(i, 'time', fromDatetimeLocal(e.target.value))}
                   className="flex-1 h-9 px-2 rounded-btn bg-surface-3 border border-border text-text-primary text-xs focus:outline-none focus:border-brand/50"
@@ -408,6 +494,7 @@ export function NewSchedulePage() {
                   type="number" min="0" step="any" placeholder="Amount"
                   value={row.amount}
                   onChange={(e) => updateTrRow(i, 'amount', e.target.value)}
+                  onBlur={() => setTrTouched((t) => ({ ...t, [`row${i}`]: true }))}
                   className="w-28 h-9 px-2 rounded-btn bg-surface-3 border border-border text-text-primary text-xs tabular-nums placeholder:text-text-muted focus:outline-none focus:border-brand/50"
                 />
                 <button onClick={() => removeTrRow(i)} disabled={trRows.length <= 1}
@@ -438,7 +525,8 @@ export function NewSchedulePage() {
             </div>
           )}
 
-          {trVal.errors.length > 0 && (
+          {/* Validation errors — shown only after touch or submit attempt */}
+          {showTrErrors && trVal.errors.length > 0 && (
             <ul className="space-y-1">
               {trVal.errors.map((e) => (
                 <li key={e} className="text-error text-xs">{e}</li>
@@ -451,7 +539,7 @@ export function NewSchedulePage() {
             disabled={!canSubmitTranches}
             loading={isSubmitting}
             notConnected={!address}
-            onClick={handleSubmit}
+            onClick={() => { void handleSubmit() }}
           />
         </div>
       )}
@@ -469,7 +557,7 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 }
 
 function SubmitButton({ label, disabled, loading, notConnected, onClick }: {
-  label: string; disabled: boolean; loading: boolean; notConnected: boolean; onClick: () => unknown
+  label: string; disabled: boolean; loading: boolean; notConnected: boolean; onClick: () => void
 }) {
   if (notConnected) {
     return (

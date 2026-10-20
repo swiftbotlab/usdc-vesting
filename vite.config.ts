@@ -11,7 +11,7 @@ const productionSecurityPlugin: Plugin = {
     const csp = [
       "default-src 'none'",
       "script-src 'self'",
-      "style-src 'self'",
+      "style-src 'self' 'unsafe-inline'",
       "img-src 'self' data:",
       "font-src 'self'",
       "connect-src https://rpc.mainnet.arc.io https://rpc.testnet.arc.io",

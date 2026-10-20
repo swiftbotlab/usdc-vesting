@@ -4,14 +4,14 @@ import { useAccount, useReadContracts } from 'wagmi'
 import { NetworkContext } from '../App'
 import { NETWORKS } from '../config/networks'
 import { VESTING_ABI } from '../lib/abi'
-import { formatNativeUsdc, statusFromCode, computeVestedAt, computeClaimable } from '../lib/vesting'
+import { formatNativeUsdc, exactNativeUsdc, statusFromCode, computeVestedAt, computeClaimable, type RawTranche } from '../lib/vesting'
 import { StatusBadge } from '../components/StatusBadge'
-import { Search, Plus, Clock, TrendingUp, CheckCircle, Undo2 } from 'lucide-react'
+import { Search, Plus, Clock, TrendingUp, CheckCircle, Undo2, Activity } from 'lucide-react'
 
 interface ScheduleSummary {
   id: bigint
-  funder: string
-  beneficiary: string
+  funder: `0x${string}`
+  beneficiary: `0x${string}`
   total: bigint
   claimed: bigint
   refunded: bigint
@@ -22,20 +22,13 @@ interface ScheduleSummary {
   kind: number
   revocable: boolean
   statusCode: number
+  tranches: RawTranche[]
 }
 
 function ScheduleRow({ s, network, role, nowSec }: { s: ScheduleSummary; network: string; role: 'funding' | 'receiving'; nowSec: number }) {
   const status = statusFromCode(s.statusCode)
-  const vested = computeVestedAt(
-    { funder: s.funder as `0x${string}`, beneficiary: s.beneficiary as `0x${string}`, total: s.total, claimed: s.claimed, refunded: s.refunded, start: s.start, cliff: s.cliff, end: s.end, cancelledAt: s.cancelledAt, kind: s.kind, revocable: s.revocable },
-    [],
-    nowSec
-  )
-  const claimable = computeClaimable(
-    { funder: s.funder as `0x${string}`, beneficiary: s.beneficiary as `0x${string}`, total: s.total, claimed: s.claimed, refunded: s.refunded, start: s.start, cliff: s.cliff, end: s.end, cancelledAt: s.cancelledAt, kind: s.kind, revocable: s.revocable },
-    [],
-    nowSec
-  )
+  const vested = computeVestedAt(s, s.tranches, nowSec)
+  const claimable = computeClaimable(s, s.tranches, nowSec)
   const counterparty = role === 'funding' ? s.beneficiary : s.funder
 
   return (
@@ -53,20 +46,63 @@ function ScheduleRow({ s, network, role, nowSec }: { s: ScheduleSummary; network
           </span>
           <StatusBadge status={status} />
         </div>
-        <div className="text-xs text-text-secondary mt-0.5">
+        <div className="text-xs text-text-secondary mt-0.5" title={exactNativeUsdc(s.total)}>
           {formatNativeUsdc(s.total)} USDC total
         </div>
       </div>
-      <div className="text-right flex-shrink-0">
-        <div className="text-xs font-mono text-text-primary tabular-nums">
-          {formatNativeUsdc(vested, { decimals: 4 })}
+      <div className="text-right flex-shrink-0 space-y-0.5">
+        <div className="text-xs font-mono text-text-primary tabular-nums" title={exactNativeUsdc(vested)}>
+          {formatNativeUsdc(vested, { decimals: 6 })}
         </div>
         <div className="text-[10px] text-text-muted">vested</div>
         {claimable > 0n && (
-          <div className="text-[10px] text-success mt-0.5 font-medium">
-            {formatNativeUsdc(claimable, { decimals: 4 })} claimable
+          <div className="text-[10px] text-success font-medium" title={exactNativeUsdc(claimable)}>
+            {formatNativeUsdc(claimable, { decimals: 6 })} claimable
           </div>
         )}
+      </div>
+    </a>
+  )
+}
+
+function LatestScheduleRow({ id, network, raw, statusCode }: {
+  id: bigint
+  network: string
+  raw: { funder: `0x${string}`; beneficiary: `0x${string}`; total: bigint; kind: number } | undefined
+  statusCode: number | undefined
+}) {
+  const status = statusFromCode(statusCode ?? 0)
+  if (!raw) return (
+    <div className="flex items-center gap-3 p-3 rounded-card border border-border animate-pulse">
+      <div className="w-8 h-8 rounded-lg bg-surface-3" />
+      <div className="flex-1 h-4 bg-surface-3 rounded" />
+    </div>
+  )
+  return (
+    <a
+      href={`#/${network}/schedule/${id}`}
+      className="flex items-center gap-3 p-3 rounded-card border border-border hover:border-brand/30 hover:bg-surface-2 transition-all group cursor-pointer"
+    >
+      <div className="w-8 h-8 rounded-lg bg-surface-3 flex items-center justify-center flex-shrink-0 text-text-muted group-hover:bg-brand-muted group-hover:text-brand transition-colors">
+        <span className="font-mono text-xs">#{id.toString()}</span>
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="font-mono text-xs text-text-muted">
+            {raw.funder.slice(0, 6)}…{raw.funder.slice(-4)}
+          </span>
+          <span className="text-text-muted text-xs">→</span>
+          <span className="font-mono text-xs text-text-muted">
+            {raw.beneficiary.slice(0, 6)}…{raw.beneficiary.slice(-4)}
+          </span>
+          <StatusBadge status={status} />
+          <span className="text-[10px] text-text-muted border border-border px-1.5 rounded-chip">{raw.kind === 0 ? 'Linear' : 'Tranches'}</span>
+        </div>
+      </div>
+      <div className="text-right flex-shrink-0">
+        <div className="text-xs font-mono text-text-primary tabular-nums" title={exactNativeUsdc(raw.total)}>
+          {formatNativeUsdc(raw.total)} USDC
+        </div>
       </div>
     </a>
   )
@@ -86,7 +122,30 @@ export function HomePage() {
     chainId: cfg.chain.id,
   } as const
 
-  // Fetch ids for connected wallet
+  // ─── Contract stats: scheduleCount + totalLocked ───────────────────────────
+  const { data: statsData } = useReadContracts({
+    contracts: [
+      { ...contractBase, functionName: 'scheduleCount' },
+      { ...contractBase, functionName: 'totalLocked' },
+    ],
+    query: { refetchInterval: 30_000 },
+  })
+  const scheduleCount = (statsData?.[0]?.result) ?? 0n
+  const totalLocked = (statsData?.[1]?.result) ?? 0n
+
+  // ─── Latest 10 schedules (newest first) ───────────────────────────────────
+  const latestIds: bigint[] = []
+  for (let i = scheduleCount; i >= 1n && latestIds.length < 10; i--) latestIds.push(i)
+
+  const { data: latestData } = useReadContracts({
+    contracts: [
+      ...latestIds.map((id) => ({ ...contractBase, functionName: 'getSchedule' as const, args: [id] as const })),
+      ...latestIds.map((id) => ({ ...contractBase, functionName: 'status' as const, args: [id] as const })),
+    ],
+    query: { enabled: latestIds.length > 0, refetchInterval: 30_000 },
+  })
+
+  // ─── User wallet schedules ─────────────────────────────────────────────────
   const { data: idsData } = useReadContracts({
     contracts: address
       ? [
@@ -100,35 +159,30 @@ export function HomePage() {
   const fundedIds: bigint[] = (idsData?.[0]?.result as bigint[] | undefined) ?? []
   const beneficiaryIds: bigint[] = (idsData?.[1]?.result as bigint[] | undefined) ?? []
 
-  // Fetch schedules for all ids
+  // Fetch schedules + statuses + tranches for all user ids
   const allIds = [...new Set([...fundedIds, ...beneficiaryIds])]
-  const scheduleContracts = allIds.map((id) => ({
-    ...contractBase,
-    functionName: 'getSchedule' as const,
-    args: [id] as const,
-  }))
-  const statusContracts = allIds.map((id) => ({
-    ...contractBase,
-    functionName: 'status' as const,
-    args: [id] as const,
-  }))
-
   const { data: scheduleData } = useReadContracts({
-    contracts: [...scheduleContracts, ...statusContracts],
+    contracts: [
+      ...allIds.map((id) => ({ ...contractBase, functionName: 'getSchedule' as const, args: [id] as const })),
+      ...allIds.map((id) => ({ ...contractBase, functionName: 'status' as const, args: [id] as const })),
+      ...allIds.map((id) => ({ ...contractBase, functionName: 'getTranches' as const, args: [id] as const })),
+    ],
     query: { enabled: allIds.length > 0, refetchInterval: 15_000 },
   })
 
+  const n = allIds.length
   const schedules: ScheduleSummary[] = allIds.map((id, i) => {
     const raw = scheduleData?.[i]?.result as {
       funder: `0x${string}`; beneficiary: `0x${string}`; total: bigint; claimed: bigint
       refunded: bigint; start: bigint; cliff: bigint; end: bigint; cancelledAt: bigint
       kind: number; revocable: boolean
     } | undefined
-    const statusCode = scheduleData?.[allIds.length + i]?.result as number | undefined
+    const statusCode = scheduleData?.[n + i]?.result as number | undefined
+    const tranches = (scheduleData?.[2 * n + i]?.result as RawTranche[] | undefined) ?? []
     return {
       id,
-      funder: raw?.funder ?? '0x',
-      beneficiary: raw?.beneficiary ?? '0x',
+      funder: raw?.funder ?? ('0x'),
+      beneficiary: raw?.beneficiary ?? ('0x'),
       total: raw?.total ?? 0n,
       claimed: raw?.claimed ?? 0n,
       refunded: raw?.refunded ?? 0n,
@@ -139,6 +193,7 @@ export function HomePage() {
       kind: raw?.kind ?? 0,
       revocable: raw?.revocable ?? false,
       statusCode: statusCode ?? 0,
+      tranches,
     }
   })
 
@@ -206,6 +261,26 @@ export function HomePage() {
         ))}
       </div>
 
+      {/* Contract stats */}
+      <div className="grid grid-cols-2 gap-3">
+        <div className="bg-surface rounded-card border border-border p-4 shadow-card text-center">
+          <div className="flex items-center justify-center gap-1.5 text-text-muted text-xs mb-1">
+            <Activity size={12} /> Schedules created
+          </div>
+          <div className="font-display font-bold text-2xl text-text-primary tabular-nums">
+            {scheduleCount.toString()}
+          </div>
+        </div>
+        <div className="bg-surface rounded-card border border-border p-4 shadow-card text-center">
+          <div className="flex items-center justify-center gap-1.5 text-text-muted text-xs mb-1">
+            <Activity size={12} /> Total locked
+          </div>
+          <div className="font-display font-bold text-2xl text-text-primary tabular-nums" title={exactNativeUsdc(totalLocked)}>
+            {formatNativeUsdc(totalLocked, { decimals: 4 })} <span className="text-sm font-normal text-text-muted">USDC</span>
+          </div>
+        </div>
+      </div>
+
       {/* Look up */}
       <div className="bg-surface rounded-card border border-border p-5 shadow-card">
         <h2 className="font-display font-semibold text-sm text-text-primary mb-3">Look up a schedule</h2>
@@ -229,6 +304,29 @@ export function HomePage() {
           </button>
         </form>
       </div>
+
+      {/* Latest schedules — always visible without wallet */}
+      {latestIds.length > 0 && (
+        <div>
+          <h2 className="font-display font-semibold text-sm text-text-primary mb-3 flex items-center gap-2">
+            Latest schedules
+            <span className="bg-surface-3 text-text-muted text-xs px-2 py-0.5 rounded-chip">
+              {latestIds.length} of {scheduleCount.toString()}
+            </span>
+          </h2>
+          <div className="space-y-2">
+            {latestIds.map((id, i) => {
+              const raw = latestData?.[i]?.result as {
+                funder: `0x${string}`; beneficiary: `0x${string}`; total: bigint; kind: number
+              } | undefined
+              const statusCode = latestData?.[latestIds.length + i]?.result as number | undefined
+              return (
+                <LatestScheduleRow key={id.toString()} id={id} network={network} raw={raw} statusCode={statusCode} />
+              )
+            })}
+          </div>
+        </div>
+      )}
 
       {/* My schedules */}
       {address ? (
